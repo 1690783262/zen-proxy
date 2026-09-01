@@ -103,6 +103,42 @@ function pushDbg(entry) {
   if (DEBUG_LOG.length > 8) DEBUG_LOG.shift()
 }
 
+/**
+ * 根据诊断字段自动给出结论（/debug 页和后台日志都带上，省得猜）
+ */
+function diagnose(d) {
+  const wantsTools = (d.toolCount || 0) > 0
+  const emitted = d.emittedToolChunks || 0
+  const evKeys = Object.keys(d.events || {})
+  const sawFnEvents = evKeys.some((k) => k.includes('function_call') || k.includes('tool'))
+  const foundCalls = sawFnEvents || (d.toolCalls?.length || 0) > 0
+  if (d.upstreamStatus && d.upstreamStatus !== 200) {
+    return `上游返回 ${d.upstreamStatus}（429=免费额度限流，等一会再试；403=地域问题）`
+  }
+  if (wantsTools && foundCalls) {
+    if (d.stream && emitted === 0) return '上游有 function_call 事件但代理没送出 -> 转换层 bug，把 /debug 内容发我'
+    return '代理已正确送出结构化 tool_calls。若 Hermes 仍报 "signaled but sent none"，问题在 Hermes 侧解析，把 /debug 内容发我'
+  }
+  if (wantsTools && (d.textLen || 0) > 0) {
+    return '上游没有返回任何结构化 function_call，只有文本' +
+      (d.textToolLike?.length ? `，且文本里疑似出现 ${d.textToolLike.join('/')} 等工具调用语法` : '') +
+      ' —— 模型很可能不支持函数调用（或免费档不开放），代理无从转换，考虑换支持 tools 的模型'
+  }
+  if (wantsTools) return '上游没返回工具调用也没有文本输出'
+  return '本请求没带 tools（普通对话）'
+}
+
+/** 疑似"模型把工具调用写在文本里"的特征串 */
+const TOOL_TEXT_PATTERNS = ['<tool_call', '"name"', '"arguments"', '"function"', 'tool_calls']
+
+function scanToolLike(text) {
+  const flags = []
+  if (!text) return flags
+  const low = text.toLowerCase()
+  for (const p of TOOL_TEXT_PATTERNS) if (low.includes(p)) flags.push(p)
+  return flags
+}
+
 function safeJson(s) {
   if (!s) return {}
   try { return JSON.parse(s) } catch { return {} }
@@ -185,7 +221,7 @@ function chatToResponsesRequest(chatBody) {
 // ============================================================================
 // Responses -> Chat Completions 响应转换（非流式）
 // ============================================================================
-function responsesToChatResponse(respJson, model) {
+function responsesToChatResponse(respJson, model, dbg) {
   let content = null
   const toolCalls = []
   const dbgCalls = []
@@ -204,12 +240,15 @@ function responsesToChatResponse(respJson, model) {
       dbgCalls.push({ name: item.name || '', call_id: item.call_id || item.id, argsLen: args.length })
     }
   }
-  if (dbgCalls.length) {
-    pushDbg({
-      time: new Date().toISOString(), mode: 'non-stream', model,
-      outputTypes: (respJson.output || []).map((o) => o?.type),
-      functionCalls: dbgCalls, status: respJson.status,
-    })
+  if (dbg) {
+    dbg.outputTypes = (respJson.output || []).map((o) => o?.type)
+    dbg.toolCalls = dbgCalls
+    dbg.textLen = (content || '').length
+    const flags = scanToolLike(content)
+    if (flags.length) dbg.textToolLike = flags
+    dbg.finishReason = toolCalls.length ? 'tool_calls' : 'stop'
+    dbg.诊断 = diagnose(dbg)
+    pushDbg(dbg)
   }
   const message = { role: 'assistant', content }
   if (toolCalls.length) {
@@ -251,6 +290,8 @@ function transformResponsesStreamToChat(upstreamBody, model, respId, dbg) {
   const items = new Map()
   let finishReason = null
   let usage = null
+  let textLen = 0
+  const textFlags = new Set()
 
   const chunk = (delta, extra = {}) => ({
     id: 'chatcmpl-' + String(respId).slice(0, 29),
@@ -273,7 +314,8 @@ function transformResponsesStreamToChat(upstreamBody, model, respId, dbg) {
       const sendTool = (tc) => {
         ensureRole()
         emittedToolChunks++
-        send(chunk({ delta: { tool_calls: [tc] } }))
+        // 注意：chunk() 的参数本身就是 delta 对象，不要再包一层 delta
+        send(chunk({ tool_calls: [tc] }))
       }
 
       /** 在 done 时兜底送出完整 arguments（上游"一次性给全"的场景） */
@@ -326,6 +368,8 @@ function transformResponsesStreamToChat(upstreamBody, model, respId, dbg) {
                   if (ev.delta) {
                     ensureRole()
                     sentText = true
+                    textLen += String(ev.delta).length
+                    for (const f of scanToolLike(ev.delta)) textFlags.add(f)
                     send(chunk({ content: ev.delta }))
                   }
                   break
@@ -370,7 +414,12 @@ function transformResponsesStreamToChat(upstreamBody, model, respId, dbg) {
                   // 兜底 1：没流过任何文本，但最终输出里有 message -> 一次性补发
                   if (!sentText) {
                     const t = out.filter((o) => o?.type === 'message').map((o) => textOf(o.content)).join('')
-                    if (t) { ensureRole(); sentText = true; send(chunk({ content: t })) }
+                    if (t) {
+                      ensureRole(); sentText = true
+                      textLen += t.length
+                      for (const f of scanToolLike(t)) textFlags.add(f)
+                      send(chunk({ content: t }))
+                    }
                   }
                   // 兜底 2：完整 output 里还有从未露面的 function_call -> 补发
                   for (const o of out) {
@@ -417,7 +466,15 @@ function transformResponsesStreamToChat(upstreamBody, model, respId, dbg) {
         dbg.events = events
         dbg.emittedToolChunks = emittedToolChunks
         dbg.finishReason = finishReason
+        dbg.textLen = textLen
+        if (textFlags.size) dbg.textToolLike = [...textFlags]
+        dbg.诊断 = diagnose(dbg)
         pushDbg(dbg)
+        console.log('[zen-proxy] stream-done', JSON.stringify({
+          rid: dbg.rid, status: dbg.upstreamStatus, events,
+          toolChunks: emittedToolChunks, finish: finishReason,
+          textLen, textToolLike: [...textFlags], 诊断: dbg.诊断,
+        }))
       }
     },
   })
@@ -435,6 +492,10 @@ async function handle(request) {
     })
 
   const env = (k) => Deno.env.get(k)
+
+  // 跨实例诊断：console.log 会进入 Deno Deploy 控制台的 Logs（内存 /debug 只在单个实例内有效）
+  const log = (obj) => { try { console.log('[zen-proxy]', JSON.stringify(obj)) } catch { } }
+  const rid = crypto.randomUUID().slice(0, 8)
 
   if (request.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: CORS_HEADERS })
@@ -512,8 +573,16 @@ async function handle(request) {
     if ((url.searchParams.get('key') || '') !== PROXY_API_KEY) {
       return json({ error: '在网址后面加 ?key=你的PROXY_API_KEY' }, 401)
     }
+    let instance = 'unknown'
+    try { instance = Deno.env.get('DENO_DEPLOYMENT_ID') || 'unknown' } catch { }
     return json({
-      说明: '最近 8 次经过转换层的请求诊断（不含对话内容）。在 Hermes 触发一次工具调用后再刷新本页。',
+      说明: '最近 8 次经过转换层的请求诊断（不含对话内容）。每条记录末尾的"诊断"字段直接给出结论。',
+      重要提示: [
+        '诊断存在单个实例的内存里，实例回收会清空 —— 若这里为空但 Hermes 明明请求过，说明实例被回收或请求没到这个地址',
+        '跨实例的完整日志在 Deno Deploy 控制台：你的 App → 左侧 Logs（或 Observability），找 [zen-proxy] 开头的行',
+        '每条日志带 8 位 rid，可用于对应具体请求',
+      ],
+      当前实例: instance,
       最近请求: DEBUG_LOG,
     })
   }
@@ -525,7 +594,11 @@ async function handle(request) {
     request.headers.get('api-key') ||
     ''
   if (!incoming || incoming !== PROXY_API_KEY) {
+    log({ rid, path: url.pathname, authFail: true, gotKey: !!incoming })
     return json({ error: { message: 'Unauthorized: 代理钥匙不对或没带' } }, 401)
+  }
+  if (url.pathname.endsWith('/chat/completions')) {
+    log({ rid, path: url.pathname, phase: 'arrive' })
   }
 
   const base = (env('ZEN_BASE_URL') || ZEN_DEFAULT_BASE).replace(/\/+$/, '')
@@ -578,12 +651,13 @@ async function handle(request) {
     // ============ Responses 转换路径 ============
     const responsesBody = chatToResponsesRequest(payload)
     const dbg = {
-      time: new Date().toISOString(), model,
+      rid, time: new Date().toISOString(), model,
       stream: !!responsesBody.stream,
       toolCount: (responsesBody.tools || []).length,
       inputItems: (responsesBody.input || []).map((i) => i.type || i.role),
       upstreamStatus: null, events: {}, toolCalls: [], emittedToolChunks: 0, finishReason: null,
     }
+    log({ rid, phase: 'convert', model, stream: dbg.stream, tools: dbg.toolCount })
     let upstream
     try {
       upstream = await fetch(base + '/responses', {
@@ -591,13 +665,17 @@ async function handle(request) {
       })
     } catch (err) {
       dbg.upstreamStatus = 'fetch-error'; dbg.error = String(err); pushDbg(dbg)
+      log({ rid, phase: 'fetch-error', error: String(err) })
       return json({ error: { message: '连不上上游: ' + String(err) } }, 502)
     }
     dbg.upstreamStatus = upstream.status
 
     if (!upstream.ok) {
       const text = await upstream.text().catch(() => '')
-      dbg.upstreamError = text.slice(0, 300); pushDbg(dbg)
+      dbg.upstreamError = text.slice(0, 300)
+      dbg.诊断 = diagnose(dbg)
+      pushDbg(dbg)
+      log({ rid, phase: 'upstream-error', status: upstream.status, body: text.slice(0, 120) })
       return new Response(text || JSON.stringify({ error: { message: '上游返回 ' + upstream.status } }), {
         status: upstream.status,
         headers: { ...CORS_HEADERS, 'Content-Type': upstream.headers.get('Content-Type') || 'application/json' },
@@ -609,9 +687,13 @@ async function handle(request) {
       return new Response(transformResponsesStreamToChat(upstream.body, model, upstream.headers.get('x-request-id') || crypto.randomUUID(), dbg), { status: 200, headers: outHeaders })
     }
     const respJson = await upstream.json().catch(() => null)
-    if (!respJson) { dbg.upstreamError = '非 JSON'; pushDbg(dbg); return json({ error: { message: '上游返回非 JSON' } }, 502) }
+    if (!respJson) {
+      dbg.upstreamError = '非 JSON'; dbg.诊断 = '上游返回非 JSON，把 /debug 发我'
+      pushDbg(dbg)
+      return json({ error: { message: '上游返回非 JSON' } }, 502)
+    }
     const outHeaders = new Headers({ ...CORS_HEADERS, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
-    return new Response(JSON.stringify(responsesToChatResponse(respJson, model)), { status: 200, headers: outHeaders })
+    return new Response(JSON.stringify(responsesToChatResponse(respJson, model, dbg)), { status: 200, headers: outHeaders })
   }
 
   // ============ 普通透传路径（models、其他模型等） ============
