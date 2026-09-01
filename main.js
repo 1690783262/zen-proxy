@@ -1,27 +1,32 @@
 /**
- * OpenCode Zen -> OpenAI 兼容代理（Deno Deploy 版）
+ * OpenCode Zen -> OpenAI Chat Completions 兼容代理（Deno Deploy 版 · 双协议）
  *
- * 为什么从 Cloudflare Pages 换过来：Cloudflare 的出网请求被 Zen 判定为中国
- * （即使头已剥离、节点在 SEA），这是平台层行为，换 Deno Deploy（出网美国）解决。
+ * 背景链路：
+ *   1. muse-spark 系列被 Meta 地域政策限制 -> 需要境外出网代理
+ *   2. Cloudflare 全平台出网被 Zen 判定为中国 -> 换 Deno Deploy（出网美国）
+ *   3. Zen 的 muse 系列只支持 Responses API（/v1/responses），
+ *      而 Hermes 只会说 Chat Completions -> 本代理做双向格式转换
  *
- * 部署：console.deno.com -> New App -> 连接 GitHub 仓库（网页上传文件即可）
- *       入口文件选本文件 main.js，无需构建命令。
+ * 对 Hermes 完全透明：Hermes 照常发 chat/completions（含工具调用、流式），
+ * 代理转换成 Responses 格式发给 Zen，再把结果翻译回 chat 格式。
  *
- * 环境变量（App 设置 -> Add/Edit environment variables，选 Secret + Production）：
- *   ZEN_API_KEY    = 你的 OpenCode Zen key
- *   PROXY_API_KEY  = 自己起一个，Hermes 里填它
+ * 部署：console.deno.com -> New App -> GitHub 仓库 -> Entrypoint 填 main.js
+ * 环境变量：ZEN_API_KEY / PROXY_API_KEY（Secret + Production）
  *
  * 端点：
- *   POST /v1/chat/completions   对话（支持流式）
- *   GET  /v1/models             模型列表
- *   GET  /zencheck              真实探活：直接问 Zen 一次（免鉴权，浏览器可开）
- *   GET  /ip                    节点位置自检（免鉴权）
+ *   POST /v1/chat/completions   对话（自动转换为 Responses API，支持流式+工具调用）
+ *   GET  /v1/models             模型列表（透传）
+ *   GET  /zencheck              真实探活（免鉴权，浏览器可开）
+ *   GET  /ip                    出网 IP 自检（免鉴权）
  *   GET  /healthz               存活检查
  */
 
 // ===== 默认值：一般不用改 =====
 const ZEN_DEFAULT_BASE = 'https://opencode.ai/zen/v1'
 const DEFAULT_MODEL = 'muse-spark-1.2-contributor-free'
+
+/** 这些模型前缀只支持 Responses API，走格式转换；其他模型原样透传 chat/completions */
+const RESPONSES_MODELS = ['muse']
 
 // 模型短名 -> 真实 ID（Hermes 里填 "muse" 就行）
 const DEFAULT_ALIASES = {
@@ -38,11 +43,7 @@ const HOP_BY_HOP = new Set([
   'content-length', 'host', 'expect',
 ])
 
-/**
- * 身份暴露头：转发前必须剥离。
- * Cloudflare/网关注入的 cf-ipcountry、x-forwarded-for 等会暴露用户真实地域，
- * 剥掉之后上游只能看到本函数出网 IP 的归属地（Deno Deploy 在美国）。
- */
+/** 身份暴露头：转发前剥离，防止泄露用户真实地域 */
 const STRIP_HEADERS = new Set([
   'cf-connecting-ip', 'cf-connecting-ipv6', 'cf-ipcountry', 'cf-ipcity',
   'cf-ipcontinent', 'cf-iplatitude', 'cf-iplongitude', 'cf-region',
@@ -53,10 +54,9 @@ const STRIP_HEADERS = new Set([
   'x-real-ip', 'true-client-ip', 'cdn-loop', 'fly-client-ip',
   'x-vercel-ip-country', 'x-vercel-forwarded-for', 'x-nf-client-connection-ip',
   'deno-deployment-id', 'x-deno-deployment-id',
-  'accept-encoding', // 避免上游压缩流二次解压问题
+  'accept-encoding',
 ])
 
-/** 中国大陆的 Cloudflare 节点代码（/ip 用，仅供参考） */
 const CN_COLOS = new Set([
   'BJS', 'PEK', 'CAN', 'PVG', 'SHA', 'SZX', 'CGO', 'CKG', 'CTU', 'FOC',
   'HFE', 'HGH', 'INC', 'KHN', 'KMG', 'NKG', 'NGB', 'TAO', 'TSN', 'URC',
@@ -82,23 +82,225 @@ code{background:#f0f2f4;padding:2px 6px;border-radius:4px;font-size:13px}
 .box{background:#f6f8fa;border:1px solid #d8dee4;border-radius:8px;padding:16px 20px;margin:20px 0}
 a{color:#0969da}
 </style></head><body>
-<h1>Zen 代理已部署（Deno Deploy）</h1>
+<h1>Zen 代理已部署（Deno Deploy · Responses 转换已启用）</h1>
 <p class="ok">服务正常运行中。</p>
 <div class="box">
-<p><code>POST /v1/chat/completions</code> — 对话（支持流式）</p>
+<p><code>POST /v1/chat/completions</code> — 对话（自动转 Responses API，支持流式+工具）</p>
 <p><code>GET /v1/models</code> — 模型列表</p>
-<p><code>GET /zencheck</code> — 真实探活，看 Zen 是否放行</p>
-<p><code>GET /ip</code> — 出口节点位置</p>
+<p><code>GET /zencheck</code> — 真实探活</p>
 </div>
-<p>先打开 <a href="/zencheck">/zencheck</a> 验证。</p>
-<p>Hermes 的 Base URL 填 <code>https://你的项目.deno.dev/v1</code>，
-API Key 填你自己设的 <code>PROXY_API_KEY</code>。</p>
+<p>Hermes 的 Base URL 填 <code>https://你的项目.deno.net/v1</code>。</p>
 </body></html>`
 
 function safeJson(s) {
   if (!s) return {}
   try { return JSON.parse(s) } catch { return {} }
 }
+
+function textOf(content) {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    return content.filter((c) => c && (c.type === 'text' || c.type === 'output_text'))
+      .map((c) => c.text || '').join('')
+  }
+  return content == null ? '' : String(content)
+}
+
+// ============================================================================
+// Chat Completions -> Responses 请求转换
+// ============================================================================
+function chatToResponsesRequest(chatBody) {
+  const input = []
+  for (const m of chatBody.messages || []) {
+    if (!m) continue
+    if (m.role === 'tool') {
+      input.push({
+        type: 'function_call_output',
+        call_id: m.tool_call_id || '',
+        output: typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? ''),
+      })
+    } else if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      if (m.content) input.push({ role: 'assistant', content: textOf(m.content) })
+      for (const tc of m.tool_calls) {
+        input.push({
+          type: 'function_call',
+          call_id: tc.id || '',
+          name: tc.function?.name || '',
+          arguments: tc.function?.arguments || '{}',
+        })
+      }
+    } else {
+      input.push({ role: m.role, content: textOf(m.content) })
+    }
+  }
+
+  const out = { model: chatBody.model, input }
+  if (Array.isArray(chatBody.tools) && chatBody.tools.length) {
+    out.tools = chatBody.tools
+      .filter((t) => t.type === 'function' && (t.function?.name || t.name))
+      .map((t) => ({
+        type: 'function',
+        name: t.function?.name || t.name,
+        description: t.function?.description || t.description || '',
+        parameters: t.function?.parameters || t.parameters || { type: 'object', properties: {} },
+      }))
+  }
+  if (chatBody.tool_choice !== undefined) {
+    if (typeof chatBody.tool_choice === 'string') out.tool_choice = chatBody.tool_choice
+    else if (chatBody.tool_choice?.function?.name) {
+      out.tool_choice = { type: 'function', name: chatBody.tool_choice.function.name }
+    }
+  }
+  const maxTok = chatBody.max_tokens ?? chatBody.max_completion_tokens
+  if (maxTok) out.max_output_tokens = Math.max(maxTok, 512) // 推理模型给太小会 500
+  if (chatBody.temperature !== undefined) out.temperature = chatBody.temperature
+  if (chatBody.top_p !== undefined) out.top_p = chatBody.top_p
+  if (chatBody.stop) out.stop = chatBody.stop
+  out.stream = !!chatBody.stream
+  return out
+}
+
+// ============================================================================
+// Responses -> Chat Completions 响应转换（非流式）
+// ============================================================================
+function responsesToChatResponse(respJson, model) {
+  let content = null
+  const toolCalls = []
+  for (const item of respJson.output || []) {
+    if (!item) continue
+    if (item.type === 'message') {
+      const t = textOf(item.content)
+      if (t) content = (content || '') + t
+    } else if (item.type === 'function_call') {
+      toolCalls.push({
+        id: item.call_id || item.id || 'call_' + crypto.randomUUID().slice(0, 8),
+        type: 'function',
+        function: { name: item.name || '', arguments: item.arguments || '{}' },
+      })
+    }
+  }
+  const message = { role: 'assistant', content }
+  if (toolCalls.length) {
+    message.tool_calls = toolCalls
+    if (content == null) message.content = null
+  }
+  const u = respJson.usage || {}
+  return {
+    id: 'chatcmpl-' + String(respJson.id || crypto.randomUUID()).slice(0, 29),
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{
+      index: 0,
+      message,
+      finish_reason: toolCalls.length ? 'tool_calls' : 'stop',
+    }],
+    usage: {
+      prompt_tokens: u.input_tokens || 0,
+      completion_tokens: u.output_tokens || 0,
+      total_tokens: (u.input_tokens || 0) + (u.output_tokens || 0),
+    },
+  }
+}
+
+// ============================================================================
+// Responses SSE -> Chat Completions SSE 流式转换
+// ============================================================================
+function transformResponsesStreamToChat(upstreamBody, model, respId) {
+  const decoder = new TextDecoder()
+  const encoder = new TextEncoder()
+  let buffer = ''
+  let started = false
+  let toolCount = 0
+  const toolIdxByItem = new Map()
+  let finishReason = null
+  let usage = null
+
+  const chunk = (delta, extra = {}) => ({
+    id: 'chatcmpl-' + String(respId).slice(0, 29),
+    object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, delta, finish_reason: null, ...extra }],
+  })
+
+  return new ReadableStream({
+    async start(controller) {
+      const send = (obj) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`))
+      const reader = upstreamBody.getReader()
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+          let idx
+          while ((idx = buffer.indexOf('\n\n')) >= 0) {
+            const rawEvent = buffer.slice(0, idx)
+            buffer = buffer.slice(idx + 2)
+            for (const line of rawEvent.split('\n')) {
+              if (!line.startsWith('data:')) continue
+              const dataStr = line.slice(5).trim()
+              if (!dataStr || dataStr === '[DONE]') continue
+              let ev
+              try { ev = JSON.parse(dataStr) } catch { continue }
+              switch (ev.type) {
+                case 'response.output_text.delta':
+                  if (!started) { started = true; send(chunk({ role: 'assistant', content: '' })) }
+                  send(chunk({ content: ev.delta || '' }))
+                  break
+                case 'response.output_item.added':
+                  if (ev.item?.type === 'function_call') {
+                    if (!started) { started = true; send(chunk({ role: 'assistant', content: '' })) }
+                    const i = toolCount++
+                    toolIdxByItem.set(ev.item.id, i)
+                    send(chunk({ delta: { tool_calls: [{ index: i, id: ev.item.call_id || ev.item.id, type: 'function', function: { name: ev.item.name || '', arguments: '' } }] } }))
+                  }
+                  break
+                case 'response.function_call_arguments.delta': {
+                  const i = toolIdxByItem.get(ev.item_id) ?? Math.max(0, toolCount - 1)
+                  send(chunk({ delta: { tool_calls: [{ index: i, function: { arguments: ev.delta || '' } }] } }))
+                  break
+                }
+                case 'response.completed':
+                  usage = ev.response?.usage || null
+                  finishReason = toolCount ? 'tool_calls' : 'stop'
+                  break
+                case 'response.failed':
+                case 'error': {
+                  const msg = ev.response?.error?.message || ev.error?.message || 'upstream stream error'
+                  send(chunk({ content: `\n[upstream error: ${msg}]` }))
+                  finishReason = finishReason || 'stop'
+                  break
+                }
+                default:
+                  break // reasoning 等 delta 直接丢弃
+              }
+            }
+          }
+        }
+      } catch { /* 上游中断，按已收内容收尾 */ }
+      send(chunk({}, { finish_reason: finishReason || (toolCount ? 'tool_calls' : 'stop') }))
+      if (usage) {
+        send({
+          id: 'chatcmpl-' + String(respId).slice(0, 29),
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model,
+          choices: [{ index: 0, delta: {}, finish_reason: null }],
+          usage: {
+            prompt_tokens: usage.input_tokens || 0,
+            completion_tokens: usage.output_tokens || 0,
+            total_tokens: (usage.input_tokens || 0) + (usage.output_tokens || 0),
+          },
+        })
+      }
+      controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+      controller.close()
+    },
+  })
+}
+
+// ============================================================================
 
 async function handle(request) {
   const url = new URL(request.url)
@@ -111,43 +313,32 @@ async function handle(request) {
 
   const env = (k) => Deno.env.get(k)
 
-  // 浏览器预检
   if (request.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: CORS_HEADERS })
   }
 
-  // 根路径：状态提示页
   if (url.pathname === '/') {
     return new Response(HOME_HTML, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } })
   }
 
-  // ---- 自检：出口节点位置（免鉴权）----
+  // ---- 自检：出网 IP（免鉴权）----
   if (url.pathname === '/ip' || url.pathname === '/healthz') {
-    let info = { ok: true, note: '代理在线（Deno Deploy）' }
+    let info = { ok: true, note: '代理在线（Deno Deploy · Responses 转换已启用）' }
     if (url.pathname === '/ip') {
       try {
-        // 用第三方服务看自己的出网 IP 归属，比 cdn-cgi/trace 准
         const r = await (await fetch('https://ipapi.co/json/')).json()
         info = {
-          出网IP: r.ip,
-          出网国家: r.country_code,
-          出网城市: r.city,
+          出网IP: r.ip, 出网国家: r.country_code, 出网城市: r.city,
           可用: r.country_code !== 'CN',
-          说明: r.country_code === 'CN'
-            ? '出网在中国大陆，Zen 会拒绝。'
-            : '出网在境外（' + (r.country_name || r.country_code) + '），应可用。',
+          说明: r.country_code === 'CN' ? '出网在中国大陆，Zen 会拒绝。' : '出网在境外，应可用。',
           下一步: '打开 /zencheck 做真实请求验证',
         }
-      } catch (e) {
-        info = { ok: false, error: String(e) }
-      }
+      } catch (e) { info = { ok: false, error: String(e) } }
     }
     return json(info)
   }
 
-  // ---- 真实探活：直接问 Zen（免鉴权）----
-  // 同时探测 Chat Completions 和 Responses 两种 API（Zen 文档里 Muse 系列标注的是 Responses），
-  // max_tokens 给足 512（太小会让推理模型在上游内部崩溃，返回 500）。
+  // ---- 真实探活（免鉴权）----
   if (url.pathname === '/zencheck') {
     const zenKey = env('ZEN_API_KEY')
     if (!zenKey) return json({ error: 'ZEN_API_KEY 没配' }, 500)
@@ -164,40 +355,21 @@ async function handle(request) {
       return probe
     }
     const model = env('DEFAULT_MODEL') || DEFAULT_MODEL
-
-    // 探测 1：Chat Completions（OpenAI 兼容格式）
-    let chat
-    try {
-      const r = await fetch(base + '/chat/completions', {
-        method: 'POST',
-        headers: mkHeaders(),
-        body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }], max_tokens: 512 }),
-      })
-      const text = await r.text()
-      chat = { 状态: r.status, 是否地域拦截: /RegionError|region|不可用/i.test(text), 返回: text.slice(0, 400) }
-    } catch (e) { chat = { 错误: String(e) } }
-
-    // 探测 2：Responses API（OpenAI Responses 格式）
     let resp
     try {
       const r = await fetch(base + '/responses', {
-        method: 'POST',
-        headers: mkHeaders(),
+        method: 'POST', headers: mkHeaders(),
         body: JSON.stringify({ model, input: 'hi', max_output_tokens: 512 }),
       })
       const text = await r.text()
-      resp = { 状态: r.status, 是否地域拦截: /RegionError|region|不可用/i.test(text), 返回: text.slice(0, 400) }
+      resp = { 状态: r.status, 是否地域拦截: /RegionError|region|不可用/i.test(text), 返回: text.slice(0, 300) }
     } catch (e) { resp = { 错误: String(e) } }
-
-    const chatOk = chat.状态 === 200
-    const respOk = resp.状态 === 200
     return json({
-      Zen是否放行: chatOk || respOk,
-      chat_completions探测: chat,
+      Zen是否放行: resp.状态 === 200,
       responses_api探测: resp,
-      Hermes怎么配: chatOk
-        ? 'api_mode 填 chat_completions（现在的配置不用改）'
-        : (respOk ? 'chat/completions 不通但 Responses 通，Hermes 侧可能需要转格式，把结果发我' : '两种都失败，把本页完整内容发我'),
+      结论: resp.状态 === 200
+        ? '通过！代理可用（muse 系列走 Responses API，代理已自动转换），去配 Hermes 吧。'
+        : 'Zen 探活失败，把本页内容发我。',
     })
   }
 
@@ -208,7 +380,7 @@ async function handle(request) {
     return json({
       error: '环境变量没配好',
       缺少: [!PROXY_API_KEY && 'PROXY_API_KEY', !ZEN_API_KEY && 'ZEN_API_KEY'].filter(Boolean),
-      做法: 'Deno Deploy 控制台 -> App -> Settings -> Environment Variables 添加后重新部署',
+      做法: 'Deno Deploy 控制台 -> Settings -> Environment Variables 添加后重新部署',
     }, 500)
   }
 
@@ -222,7 +394,6 @@ async function handle(request) {
     return json({ error: { message: 'Unauthorized: 代理钥匙不对或没带' } }, 401)
   }
 
-  // ---- 组装上游地址 ----
   const base = (env('ZEN_BASE_URL') || ZEN_DEFAULT_BASE).replace(/\/+$/, '')
   const rest = url.pathname.startsWith('/v1/') ? url.pathname.slice(3) : url.pathname
   const upstreamUrl = base + rest + (url.search || '')
@@ -243,26 +414,68 @@ async function handle(request) {
   headers.set('x-opencode-session', crypto.randomUUID())
   headers.set('x-opencode-request', crypto.randomUUID())
 
-  // ---- 请求体：模型别名重写 ----
-  let body = null
+  // ---- 解析请求体 ----
+  let payload = null
+  let rawBody = null
   if (request.method !== 'GET' && request.method !== 'HEAD') {
-    const raw = await request.text()
-    if (raw) {
-      try {
-        const payload = JSON.parse(raw)
-        const aliases = { ...DEFAULT_ALIASES, ...safeJson(env('MODEL_ALIASES')) }
-        if (typeof payload.model === 'string' && aliases[payload.model]) {
-          payload.model = aliases[payload.model]
-        }
-        if (!payload.model) payload.model = env('DEFAULT_MODEL') || DEFAULT_MODEL
-        body = JSON.stringify(payload)
-      } catch {
-        body = raw
-      }
+    rawBody = await request.text()
+    if (rawBody) {
+      try { payload = JSON.parse(rawBody) } catch { payload = null }
     }
   }
 
-  // ---- 转发 ----
+  // 模型别名重写
+  if (payload && typeof payload.model === 'string') {
+    const aliases = { ...DEFAULT_ALIASES, ...safeJson(env('MODEL_ALIASES')) }
+    if (aliases[payload.model]) payload.model = aliases[payload.model]
+  }
+  const model = payload?.model || env('DEFAULT_MODEL') || DEFAULT_MODEL
+  if (payload && !payload.model) payload.model = model
+
+  // ---- 判断是否需要 Responses 转换 ----
+  const prefixes = safeJson(env('RESPONSES_MODELS')).length
+    ? safeJson(env('RESPONSES_MODELS'))
+    : RESPONSES_MODELS
+  const needConversion = url.pathname.endsWith('/chat/completions')
+    && Array.isArray(prefixes)
+    && prefixes.some((p) => typeof p === 'string' && model.startsWith(p))
+
+  if (needConversion && payload) {
+    // ============ Responses 转换路径 ============
+    const responsesBody = chatToResponsesRequest(payload)
+    let upstream
+    try {
+      upstream = await fetch(base + '/responses', {
+        method: 'POST', headers, body: JSON.stringify(responsesBody), redirect: 'follow',
+      })
+    } catch (err) {
+      return json({ error: { message: '连不上上游: ' + String(err) } }, 502)
+    }
+
+    if (!upstream.ok) {
+      const text = await upstream.text().catch(() => '')
+      return new Response(text || JSON.stringify({ error: { message: '上游返回 ' + upstream.status } }), {
+        status: upstream.status,
+        headers: { ...CORS_HEADERS, 'Content-Type': upstream.headers.get('Content-Type') || 'application/json' },
+      })
+    }
+
+    if (responsesBody.stream) {
+      const outHeaders = new Headers({ ...CORS_HEADERS, 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store' })
+      return new Response(transformResponsesStreamToChat(upstream.body, model, upstream.headers.get('x-request-id') || crypto.randomUUID()), { status: 200, headers: outHeaders })
+    }
+    const respJson = await upstream.json().catch(() => null)
+    if (!respJson) return json({ error: { message: '上游返回非 JSON' } }, 502)
+    const outHeaders = new Headers({ ...CORS_HEADERS, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+    return new Response(JSON.stringify(responsesToChatResponse(respJson, model)), { status: 200, headers: outHeaders })
+  }
+
+  // ============ 普通透传路径（models、其他模型等） ============
+  let body = rawBody
+  if (payload && request.method !== 'GET' && request.method !== 'HEAD') {
+    body = JSON.stringify(payload)
+  }
+
   let upstream
   try {
     upstream = await fetch(upstreamUrl, { method: request.method, headers, body, redirect: 'follow' })
@@ -278,7 +491,6 @@ async function handle(request) {
     })
   }
 
-  // ---- 流式 / 非流式统一透传 ----
   const outHeaders = new Headers()
   for (const [k, v] of upstream.headers) {
     if (!HOP_BY_HOP.has(k.toLowerCase())) outHeaders.set(k, v)
@@ -290,6 +502,6 @@ async function handle(request) {
   return new Response(upstream.body, { status: upstream.status, headers: outHeaders })
 }
 
-// 本地测试可用 PORT=8793 deno run main.js 指定端口；Deno Deploy 上端口由平台接管
+// 本地测试可用 PORT=8000 deno run --allow-net --allow-env main.js；Deno Deploy 上端口由平台接管
 const port = Number(Deno.env.get('PORT') || 8000)
 Deno.serve(handle, { port })
