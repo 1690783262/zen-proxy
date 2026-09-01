@@ -146,42 +146,59 @@ async function handle(request) {
   }
 
   // ---- 真实探活：直接问 Zen（免鉴权）----
+  // 同时探测 Chat Completions 和 Responses 两种 API（Zen 文档里 Muse 系列标注的是 Responses），
+  // max_tokens 给足 512（太小会让推理模型在上游内部崩溃，返回 500）。
   if (url.pathname === '/zencheck') {
     const zenKey = env('ZEN_API_KEY')
     if (!zenKey) return json({ error: 'ZEN_API_KEY 没配' }, 500)
     const base = (env('ZEN_BASE_URL') || ZEN_DEFAULT_BASE).replace(/\/+$/, '')
-    const probe = new Headers()
-    probe.set('Authorization', `Bearer ${zenKey}`)
-    probe.set('Content-Type', 'application/json')
-    probe.set('User-Agent', env('FAKE_UA') || 'opencode')
-    probe.set('x-opencode-client', env('OPENCODE_CLIENT') || 'tui')
-    probe.set('x-opencode-project', env('OPENCODE_PROJECT') || 'hermes-zen-proxy')
-    probe.set('x-opencode-session', crypto.randomUUID())
-    probe.set('x-opencode-request', crypto.randomUUID())
+    const mkHeaders = () => {
+      const probe = new Headers()
+      probe.set('Authorization', `Bearer ${zenKey}`)
+      probe.set('Content-Type', 'application/json')
+      probe.set('User-Agent', env('FAKE_UA') || 'opencode')
+      probe.set('x-opencode-client', env('OPENCODE_CLIENT') || 'tui')
+      probe.set('x-opencode-project', env('OPENCODE_PROJECT') || 'hermes-zen-proxy')
+      probe.set('x-opencode-session', crypto.randomUUID())
+      probe.set('x-opencode-request', crypto.randomUUID())
+      return probe
+    }
+    const model = env('DEFAULT_MODEL') || DEFAULT_MODEL
+
+    // 探测 1：Chat Completions（OpenAI 兼容格式）
+    let chat
     try {
       const r = await fetch(base + '/chat/completions', {
         method: 'POST',
-        headers: probe,
-        body: JSON.stringify({
-          model: env('DEFAULT_MODEL') || DEFAULT_MODEL,
-          messages: [{ role: 'user', content: 'hi' }],
-          max_tokens: 1,
-        }),
+        headers: mkHeaders(),
+        body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }], max_tokens: 512 }),
       })
       const text = await r.text()
-      const blocked = /RegionError|region|不可用/i.test(text)
-      return json({
-        Zen是否放行: r.ok && !blocked,
-        上游HTTP状态: r.status,
-        是否被地域拦截: blocked,
-        上游返回: text.slice(0, 600),
-        结论: r.ok && !blocked
-          ? '通过！代理可用，去配 Hermes 吧。'
-          : (blocked ? 'Zen 仍按地域拒绝。' : '请求失败，看上游返回内容排查。'),
+      chat = { 状态: r.status, 是否地域拦截: /RegionError|region|不可用/i.test(text), 返回: text.slice(0, 400) }
+    } catch (e) { chat = { 错误: String(e) } }
+
+    // 探测 2：Responses API（OpenAI Responses 格式）
+    let resp
+    try {
+      const r = await fetch(base + '/responses', {
+        method: 'POST',
+        headers: mkHeaders(),
+        body: JSON.stringify({ model, input: 'hi', max_output_tokens: 512 }),
       })
-    } catch (e) {
-      return json({ error: '探活请求失败: ' + String(e) }, 502)
-    }
+      const text = await r.text()
+      resp = { 状态: r.status, 是否地域拦截: /RegionError|region|不可用/i.test(text), 返回: text.slice(0, 400) }
+    } catch (e) { resp = { 错误: String(e) } }
+
+    const chatOk = chat.状态 === 200
+    const respOk = resp.状态 === 200
+    return json({
+      Zen是否放行: chatOk || respOk,
+      chat_completions探测: chat,
+      responses_api探测: resp,
+      Hermes怎么配: chatOk
+        ? 'api_mode 填 chat_completions（现在的配置不用改）'
+        : (respOk ? 'chat/completions 不通但 Responses 通，Hermes 侧可能需要转格式，把结果发我' : '两种都失败，把本页完整内容发我'),
+    })
   }
 
   // ---- 配置检查 ----
