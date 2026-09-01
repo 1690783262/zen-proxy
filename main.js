@@ -1,5 +1,5 @@
 /**
- * OpenCode Zen -> OpenAI Chat Completions 兼容代理（Deno Deploy 版 · 双协议）
+ * OpenCode Zen -> OpenAI Chat Completions 兼容代理（Deno Deploy 版 · 双协议 v3）
  *
  * 背景链路：
  *   1. muse-spark 系列被 Meta 地域政策限制 -> 需要境外出网代理
@@ -7,8 +7,11 @@
  *   3. Zen 的 muse 系列只支持 Responses API（/v1/responses），
  *      而 Hermes 只会说 Chat Completions -> 本代理做双向格式转换
  *
- * 对 Hermes 完全透明：Hermes 照常发 chat/completions（含工具调用、流式），
- * 代理转换成 Responses 格式发给 Zen，再把结果翻译回 chat 格式。
+ * v3 修复：Hermes 报 "Model signaled a tool call but sent none"
+ *   原因：muse 是推理模型，Responses 流里 function_call 可能"一次性完整到达"
+ *   （只有 output_item.done 带完整 arguments，没有 added/arguments.delta 事件），
+ *   旧版只处理增量事件 -> Hermes 收到 arguments 为空的 tool_calls -> 解析失败。
+ *   v3 对 added / delta / done 三种事件都做兜底，保证最终一定送出完整参数。
  *
  * 部署：console.deno.com -> New App -> GitHub 仓库 -> Entrypoint 填 main.js
  * 环境变量：ZEN_API_KEY / PROXY_API_KEY（Secret + Production）
@@ -18,7 +21,7 @@
  *   GET  /v1/models             模型列表（透传）
  *   GET  /zencheck              真实探活（免鉴权，浏览器可开）
  *   GET  /ip                    出网 IP 自检（免鉴权）
- *   GET  /healthz               存活检查
+ *   GET  /debug?key=PROXY_KEY   最近请求的诊断信息（排查工具调用问题用）
  */
 
 // ===== 默认值：一般不用改 =====
@@ -82,15 +85,23 @@ code{background:#f0f2f4;padding:2px 6px;border-radius:4px;font-size:13px}
 .box{background:#f6f8fa;border:1px solid #d8dee4;border-radius:8px;padding:16px 20px;margin:20px 0}
 a{color:#0969da}
 </style></head><body>
-<h1>Zen 代理已部署（Deno Deploy · Responses 转换已启用）</h1>
+<h1>Zen 代理已部署（Deno Deploy · Responses 转换 v3）</h1>
 <p class="ok">服务正常运行中。</p>
 <div class="box">
 <p><code>POST /v1/chat/completions</code> — 对话（自动转 Responses API，支持流式+工具）</p>
 <p><code>GET /v1/models</code> — 模型列表</p>
 <p><code>GET /zencheck</code> — 真实探活</p>
+<p><code>GET /debug?key=你的PROXY_KEY</code> — 最近请求诊断（排查工具调用问题）</p>
 </div>
 <p>Hermes 的 Base URL 填 <code>https://你的项目.deno.net/v1</code>。</p>
 </body></html>`
+
+// ===== 诊断环形缓冲：记录最近 8 次请求的关键信息（不含对话内容） =====
+const DEBUG_LOG = []
+function pushDbg(entry) {
+  DEBUG_LOG.push(entry)
+  if (DEBUG_LOG.length > 8) DEBUG_LOG.shift()
+}
 
 function safeJson(s) {
   if (!s) return {}
@@ -104,6 +115,17 @@ function textOf(content) {
       .map((c) => c.text || '').join('')
   }
   return content == null ? '' : String(content)
+}
+
+/** arguments 字段规范化：上游可能给字符串 / 对象 / 空，统一成合法 JSON 字符串 */
+function normalizeArgs(a) {
+  if (a == null || a === '') return '{}'
+  if (typeof a === 'string') {
+    const t = a.trim()
+    if (!t) return '{}'
+    try { JSON.parse(t); return t } catch { return t } // 非法 JSON 原样给，让上层看到真实情况
+  }
+  return JSON.stringify(a)
 }
 
 // ============================================================================
@@ -126,7 +148,7 @@ function chatToResponsesRequest(chatBody) {
           type: 'function_call',
           call_id: tc.id || '',
           name: tc.function?.name || '',
-          arguments: tc.function?.arguments || '{}',
+          arguments: normalizeArgs(tc.function?.arguments),
         })
       }
     } else {
@@ -166,18 +188,28 @@ function chatToResponsesRequest(chatBody) {
 function responsesToChatResponse(respJson, model) {
   let content = null
   const toolCalls = []
+  const dbgCalls = []
   for (const item of respJson.output || []) {
     if (!item) continue
     if (item.type === 'message') {
       const t = textOf(item.content)
       if (t) content = (content || '') + t
-    } else if (item.type === 'function_call') {
+    } else if (item.type === 'function_call' || item.type === 'custom_tool_call') {
+      const args = normalizeArgs(item.arguments ?? item.input)
       toolCalls.push({
         id: item.call_id || item.id || 'call_' + crypto.randomUUID().slice(0, 8),
         type: 'function',
-        function: { name: item.name || '', arguments: item.arguments || '{}' },
+        function: { name: item.name || '', arguments: args },
       })
+      dbgCalls.push({ name: item.name || '', call_id: item.call_id || item.id, argsLen: args.length })
     }
+  }
+  if (dbgCalls.length) {
+    pushDbg({
+      time: new Date().toISOString(), mode: 'non-stream', model,
+      outputTypes: (respJson.output || []).map((o) => o?.type),
+      functionCalls: dbgCalls, status: respJson.status,
+    })
   }
   const message = { role: 'assistant', content }
   if (toolCalls.length) {
@@ -204,15 +236,19 @@ function responsesToChatResponse(respJson, model) {
 }
 
 // ============================================================================
-// Responses SSE -> Chat Completions SSE 流式转换
+// Responses SSE -> Chat Completions SSE 流式转换（v3：added/delta/done 全兜底）
 // ============================================================================
-function transformResponsesStreamToChat(upstreamBody, model, respId) {
+function transformResponsesStreamToChat(upstreamBody, model, respId, dbg) {
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
   let buffer = ''
   let started = false
+  let sentText = false
   let toolCount = 0
-  const toolIdxByItem = new Map()
+  let emittedToolChunks = 0
+  const events = {}
+  // item_id -> { index, args, gotArgs, hasId }
+  const items = new Map()
   let finishReason = null
   let usage = null
 
@@ -224,10 +260,51 @@ function transformResponsesStreamToChat(upstreamBody, model, respId) {
     choices: [{ index: 0, delta, finish_reason: null, ...extra }],
   })
 
+  const reader = upstreamBody.getReader()
+
   return new ReadableStream({
     async start(controller) {
       const send = (obj) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`))
-      const reader = upstreamBody.getReader()
+
+      const ensureRole = () => {
+        if (!started) { started = true; send(chunk({ role: 'assistant', content: '' })) }
+      }
+
+      const sendTool = (tc) => {
+        ensureRole()
+        emittedToolChunks++
+        send(chunk({ delta: { tool_calls: [tc] } }))
+      }
+
+      /** 在 done 时兜底送出完整 arguments（上游"一次性给全"的场景） */
+      const flushDoneCall = (item) => {
+        const full = normalizeArgs(item.arguments ?? item.input)
+        let it = items.get(item.id)
+        if (!it) {
+          // 上游从未发过 added 事件：整个调用在 done 才出现，现场补齐
+          const i = toolCount++
+          it = { index: i, args: '', gotArgs: false, hasId: false }
+          items.set(item.id, it)
+          sendTool({
+            index: i, id: item.call_id || item.id, type: 'function',
+            function: { name: item.name || '', arguments: '' },
+          })
+          it.hasId = !!(item.call_id || item.id)
+        }
+        // 参数从未流过 or 流的是空的 -> 一次性补全
+        if (full !== '{}' && (!it.gotArgs || it.args.trim() === '' || it.args === '{}')) {
+          it.args = full
+          it.gotArgs = true
+          sendTool({ index: it.index, function: { arguments: full } })
+        }
+        // added 时没有 id、done 才有 -> 补发 id
+        if (!it.hasId && (item.call_id || item.id)) {
+          it.hasId = true
+          sendTool({ index: it.index, id: item.call_id || item.id, type: 'function', function: { name: item.name || '', arguments: '' } })
+        }
+        return { name: item.name || '', call_id: item.call_id || item.id, argsLen: full.length }
+      }
+
       try {
         while (true) {
           const { done, value } = await reader.read()
@@ -243,28 +320,68 @@ function transformResponsesStreamToChat(upstreamBody, model, respId) {
               if (!dataStr || dataStr === '[DONE]') continue
               let ev
               try { ev = JSON.parse(dataStr) } catch { continue }
+              if (dbg && ev.type) events[ev.type] = (events[ev.type] || 0) + 1
               switch (ev.type) {
                 case 'response.output_text.delta':
-                  if (!started) { started = true; send(chunk({ role: 'assistant', content: '' })) }
-                  send(chunk({ content: ev.delta || '' }))
-                  break
-                case 'response.output_item.added':
-                  if (ev.item?.type === 'function_call') {
-                    if (!started) { started = true; send(chunk({ role: 'assistant', content: '' })) }
-                    const i = toolCount++
-                    toolIdxByItem.set(ev.item.id, i)
-                    send(chunk({ delta: { tool_calls: [{ index: i, id: ev.item.call_id || ev.item.id, type: 'function', function: { name: ev.item.name || '', arguments: '' } }] } }))
+                  if (ev.delta) {
+                    ensureRole()
+                    sentText = true
+                    send(chunk({ content: ev.delta }))
                   }
                   break
-                case 'response.function_call_arguments.delta': {
-                  const i = toolIdxByItem.get(ev.item_id) ?? Math.max(0, toolCount - 1)
-                  send(chunk({ delta: { tool_calls: [{ index: i, function: { arguments: ev.delta || '' } }] } }))
+                case 'response.output_item.added':
+                  if (ev.item?.type === 'function_call' || ev.item?.type === 'custom_tool_call') {
+                    const i = toolCount++
+                    const initial = normalizeArgs(ev.item.arguments ?? ev.item.input)
+                    const hasInitial = initial !== '{}'
+                    items.set(ev.item.id, { index: i, args: hasInitial ? initial : '', gotArgs: hasInitial, hasId: !!(ev.item.call_id || ev.item.id) })
+                    sendTool({
+                      index: i, id: ev.item.call_id || ev.item.id, type: 'function',
+                      function: { name: ev.item.name || '', arguments: hasInitial ? initial : '' },
+                    })
+                    if (dbg) dbg.toolCalls.push({ name: ev.item.name || '', call_id: ev.item.call_id || ev.item.id, via: 'added', initialArgsLen: initial.length })
+                  }
+                  break
+                case 'response.function_call_arguments.delta':
+                case 'response.custom_tool_call_input.delta': {
+                  let it = items.get(ev.item_id)
+                  if (!it) {
+                    // 没见过 added：现场注册一个
+                    const i = toolCount++
+                    it = { index: i, args: '', gotArgs: false, hasId: false }
+                    items.set(ev.item_id, it)
+                    sendTool({ index: i, id: ev.item_id, type: 'function', function: { name: '', arguments: '' } })
+                  }
+                  it.args += ev.delta || ''
+                  it.gotArgs = true
+                  sendTool({ index: it.index, function: { arguments: ev.delta || '' } })
                   break
                 }
+                case 'response.output_item.done':
+                  if (ev.item?.type === 'function_call' || ev.item?.type === 'custom_tool_call') {
+                    const info = flushDoneCall(ev.item)
+                    if (dbg && info) dbg.toolCalls.push({ ...info, via: 'done' })
+                  }
+                  break
                 case 'response.completed':
+                case 'response.incomplete': {
                   usage = ev.response?.usage || null
+                  const out = ev.response?.output || []
+                  // 兜底 1：没流过任何文本，但最终输出里有 message -> 一次性补发
+                  if (!sentText) {
+                    const t = out.filter((o) => o?.type === 'message').map((o) => textOf(o.content)).join('')
+                    if (t) { ensureRole(); sentText = true; send(chunk({ content: t })) }
+                  }
+                  // 兜底 2：完整 output 里还有从未露面的 function_call -> 补发
+                  for (const o of out) {
+                    if ((o?.type === 'function_call' || o?.type === 'custom_tool_call') && !items.has(o.id)) {
+                      const info = flushDoneCall(o)
+                      if (dbg) dbg.toolCalls.push({ ...info, via: 'completed-scan' })
+                    }
+                  }
                   finishReason = toolCount ? 'tool_calls' : 'stop'
                   break
+                }
                 case 'response.failed':
                 case 'error': {
                   const msg = ev.response?.error?.message || ev.error?.message || 'upstream stream error'
@@ -296,6 +413,12 @@ function transformResponsesStreamToChat(upstreamBody, model, respId) {
       }
       controller.enqueue(encoder.encode('data: [DONE]\n\n'))
       controller.close()
+      if (dbg) {
+        dbg.events = events
+        dbg.emittedToolChunks = emittedToolChunks
+        dbg.finishReason = finishReason
+        pushDbg(dbg)
+      }
     },
   })
 }
@@ -323,7 +446,7 @@ async function handle(request) {
 
   // ---- 自检：出网 IP（免鉴权）----
   if (url.pathname === '/ip' || url.pathname === '/healthz') {
-    let info = { ok: true, note: '代理在线（Deno Deploy · Responses 转换已启用）' }
+    let info = { ok: true, note: '代理在线（Deno Deploy · Responses 转换 v3）' }
     if (url.pathname === '/ip') {
       try {
         const r = await (await fetch('https://ipapi.co/json/')).json()
@@ -373,7 +496,7 @@ async function handle(request) {
     })
   }
 
-  // ---- 配置检查 ----
+  // ---- 环境变量检查（后续所有路径都需要） ----
   const PROXY_API_KEY = env('PROXY_API_KEY')
   const ZEN_API_KEY = env('ZEN_API_KEY')
   if (!PROXY_API_KEY || !ZEN_API_KEY) {
@@ -382,6 +505,17 @@ async function handle(request) {
       缺少: [!PROXY_API_KEY && 'PROXY_API_KEY', !ZEN_API_KEY && 'ZEN_API_KEY'].filter(Boolean),
       做法: 'Deno Deploy 控制台 -> Settings -> Environment Variables 添加后重新部署',
     }, 500)
+  }
+
+  // ---- 诊断端点（浏览器可开，用 query key 鉴权；不记录对话内容）----
+  if (url.pathname === '/debug') {
+    if ((url.searchParams.get('key') || '') !== PROXY_API_KEY) {
+      return json({ error: '在网址后面加 ?key=你的PROXY_API_KEY' }, 401)
+    }
+    return json({
+      说明: '最近 8 次经过转换层的请求诊断（不含对话内容）。在 Hermes 触发一次工具调用后再刷新本页。',
+      最近请求: DEBUG_LOG,
+    })
   }
 
   // ---- 访问鉴权 ----
@@ -443,17 +577,27 @@ async function handle(request) {
   if (needConversion && payload) {
     // ============ Responses 转换路径 ============
     const responsesBody = chatToResponsesRequest(payload)
+    const dbg = {
+      time: new Date().toISOString(), model,
+      stream: !!responsesBody.stream,
+      toolCount: (responsesBody.tools || []).length,
+      inputItems: (responsesBody.input || []).map((i) => i.type || i.role),
+      upstreamStatus: null, events: {}, toolCalls: [], emittedToolChunks: 0, finishReason: null,
+    }
     let upstream
     try {
       upstream = await fetch(base + '/responses', {
         method: 'POST', headers, body: JSON.stringify(responsesBody), redirect: 'follow',
       })
     } catch (err) {
+      dbg.upstreamStatus = 'fetch-error'; dbg.error = String(err); pushDbg(dbg)
       return json({ error: { message: '连不上上游: ' + String(err) } }, 502)
     }
+    dbg.upstreamStatus = upstream.status
 
     if (!upstream.ok) {
       const text = await upstream.text().catch(() => '')
+      dbg.upstreamError = text.slice(0, 300); pushDbg(dbg)
       return new Response(text || JSON.stringify({ error: { message: '上游返回 ' + upstream.status } }), {
         status: upstream.status,
         headers: { ...CORS_HEADERS, 'Content-Type': upstream.headers.get('Content-Type') || 'application/json' },
@@ -462,10 +606,10 @@ async function handle(request) {
 
     if (responsesBody.stream) {
       const outHeaders = new Headers({ ...CORS_HEADERS, 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store' })
-      return new Response(transformResponsesStreamToChat(upstream.body, model, upstream.headers.get('x-request-id') || crypto.randomUUID()), { status: 200, headers: outHeaders })
+      return new Response(transformResponsesStreamToChat(upstream.body, model, upstream.headers.get('x-request-id') || crypto.randomUUID(), dbg), { status: 200, headers: outHeaders })
     }
     const respJson = await upstream.json().catch(() => null)
-    if (!respJson) return json({ error: { message: '上游返回非 JSON' } }, 502)
+    if (!respJson) { dbg.upstreamError = '非 JSON'; pushDbg(dbg); return json({ error: { message: '上游返回非 JSON' } }, 502) }
     const outHeaders = new Headers({ ...CORS_HEADERS, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
     return new Response(JSON.stringify(responsesToChatResponse(respJson, model)), { status: 200, headers: outHeaders })
   }
