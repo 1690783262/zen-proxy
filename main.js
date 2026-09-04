@@ -19,6 +19,7 @@
  * 端点：
  *   POST /v1/chat/completions   对话（自动转换为 Responses API，支持流式+工具调用）
  *   GET  /v1/models             模型列表（透传）
+ *   GET  /stats                 调用统计（公开，仅聚合计数，Deno KV 持久）
  *   GET  /zencheck              真实探活（免鉴权，浏览器可开）
  *   GET  /ip                    出网 IP 自检（免鉴权）
  *   GET  /debug?key=PROXY_KEY   最近请求的诊断信息（排查工具调用问题用）
@@ -84,17 +85,101 @@ h1{font-size:22px;margin-bottom:8px}.ok{color:#1a7f37;font-weight:600}
 code{background:#f0f2f4;padding:2px 6px;border-radius:4px;font-size:13px}
 .box{background:#f6f8fa;border:1px solid #d8dee4;border-radius:8px;padding:16px 20px;margin:20px 0}
 a{color:#0969da}
+.stats{display:flex;gap:12px;flex-wrap:wrap;margin:12px 0}
+.stat{flex:1 1 120px;background:#fff;border:1px solid #d8dee4;border-radius:8px;padding:10px 14px;text-align:center}
+.stat .num{font-size:24px;font-weight:700;color:#0969da}
+.stat .lbl{font-size:12px;color:#57606a}
+.pill{display:inline-block;padding:2px 10px;border-radius:99px;font-size:13px;margin:2px 4px;background:#eef1f4}
+.pill.g{background:#dafbe1;color:#1a7f37}.pill.r{background:#ffebe9;color:#cf222e}
+summary{cursor:pointer;color:#57606a;font-size:13px}
+.muted{color:#8b949e;font-size:12px}
 </style></head><body>
 <h1>Zen 代理已部署（Deno Deploy · Responses 转换 v3）</h1>
 <p class="ok">服务正常运行中。</p>
 <div class="box">
+<p style="margin-top:0"><b>API 调用统计</b> <span class="muted">（Deno KV 跨实例持久，30 秒自动刷新）</span></p>
+<div class="stats">
+<div class="stat"><div class="num" id="s-today">–</div><div class="lbl">本额度日调用<br><span style="font-size:10px">每天早8点重置</span></div></div>
+<div class="stat"><div class="num" id="s-total">–</div><div class="lbl">总调用</div></div>
+<div class="stat"><div class="num" id="s-ok">–</div><div class="lbl">成功</div></div>
+<div class="stat"><div class="num" id="s-429">–</div><div class="lbl">限流 429</div></div>
+</div>
+<p id="s-extra" class="muted" style="margin-bottom:0">加载中…</p>
+</div>
+<div class="box">
 <p><code>POST /v1/chat/completions</code> — 对话（自动转 Responses API，支持流式+工具）</p>
 <p><code>GET /v1/models</code> — 模型列表</p>
+<p><code>GET /stats</code> — 调用统计（JSON）</p>
 <p><code>GET /zencheck</code> — 真实探活</p>
 <p><code>GET /debug?key=你的PROXY_KEY</code> — 最近请求诊断（排查工具调用问题）</p>
 </div>
 <p>Hermes 的 Base URL 填 <code>https://你的项目.deno.net/v1</code>。</p>
+<script>
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+async function loadStats(){
+  try{
+    const s = await (await fetch('/stats',{cache:'no-store'})).json()
+    document.getElementById('s-today').textContent = s.今日.调用
+    document.getElementById('s-total').textContent = s.总调用.次数
+    document.getElementById('s-ok').textContent = s.总调用.成功
+    document.getElementById('s-429').textContent = s.总调用['限流429']
+    const models = (s.各模型||[]).map(m=>'<span class="pill">'+esc(m.model)+' × '+m.calls+'</span>').join('') || '<span class="muted">暂无记录</span>'
+    document.getElementById('s-extra').innerHTML =
+      '今日 tokens：输入 ' + s.今日.输入tokens + ' / 输出 ' + s.今日.输出tokens +
+      ' · 其他错误 ' + s.总调用.其他错误 +
+      '<br>' + models +
+      '<br>数据截至 ' + esc(s.更新时间) + '（额度日 ' + esc(s.今日.日期) + '，与 Zen 额度同步每天早 8 点重置）'
+  }catch(e){ document.getElementById('s-extra').textContent = '统计暂不可用：' + e }
+}
+loadStats(); setInterval(loadStats, 30000)
+</script>
 </body></html>`
+
+// ============================================================================
+// 调用统计（Deno KV 跨实例持久；KV 不可用时退化为单实例内存计数）
+// ============================================================================
+const STATS_MEM = {}
+let kv = null
+try { kv = await Deno.openKv() } catch { kv = null } // 本地跑需 --unstable-kv；Deploy 上默认可用
+
+/** "额度日"日期串：跟随 Zen 免费额度规则，每天 UTC 0 点（北京时间早上 8 点）翻新 */
+const bjDate = () => new Date().toISOString().slice(0, 10)
+
+async function bump(key, n = 1) {
+  if (!n) return
+  try {
+    if (kv) {
+      await kv.atomic().sum(key, BigInt(n)).commit()
+      return
+    }
+  } catch (e) {
+    try { console.log('[zen-proxy] stats-kv-fallback', key.join('|'), String(e)) } catch { }
+  }
+  const k = key.join('|')
+  STATS_MEM[k] = (STATS_MEM[k] || 0) + n
+}
+
+/** 只记 token 消耗（流式转换结束时的 usage 回调用） */
+function recordTokens(usage) {
+  if (!usage) return
+  const day = bjDate()
+  bump(['stat', 'tok_in', 'day', day], usage.input_tokens || 0)
+  bump(['stat', 'tok_out', 'day', day], usage.output_tokens || 0)
+}
+
+/**
+ * 一次 chat/completions 调用结束后的计数入口（不含任何对话内容）
+ * status: 上游最终 HTTP 状态（0 = 连不上上游）
+ */
+function recordCall({ model, status, usage }) {
+  const kind = status === 200 ? 'ok' : (status === 429 ? '429' : 'err')
+  const day = bjDate()
+  bump(['stat', 'calls'])
+  bump(['stat', 'kind', kind])
+  bump(['stat', 'day', day])
+  bump(['stat', 'model', model || 'unknown'])
+  if (usage) recordTokens(usage)
+}
 
 // ===== 诊断环形缓冲：记录最近 8 次请求的关键信息（不含对话内容） =====
 const DEBUG_LOG = []
@@ -462,6 +547,7 @@ function transformResponsesStreamToChat(upstreamBody, model, respId, dbg) {
       }
       controller.enqueue(encoder.encode('data: [DONE]\n\n'))
       controller.close()
+      if (usage && dbg?.usageCb) { try { dbg.usageCb(usage) } catch { } }
       if (dbg) {
         dbg.events = events
         dbg.emittedToolChunks = emittedToolChunks
@@ -557,6 +643,45 @@ async function handle(request) {
     })
   }
 
+  // ---- 调用统计（公开，只有聚合计数，不含任何内容）----
+  if (url.pathname === '/stats') {
+    const out = {}
+    if (kv) {
+      try {
+        for await (const e of kv.list({ prefix: ['stat'] })) {
+          const v = e.value
+          out[e.key.slice(1).join('|')] = typeof v === 'bigint' ? Number(v) : Number(v?.value ?? v) || 0
+        }
+      } catch (e) {
+        try { console.log('[zen-proxy] stats-list-error', String(e)) } catch { }
+      }
+    }
+    for (const [k, v] of Object.entries(STATS_MEM)) out[k] = (out[k] || 0) + v
+    const day = bjDate()
+    const get = (k) => out[k] || 0
+    return json({
+      说明: '代理的 chat/completions 调用统计（仅聚合计数，不含对话内容）。Deno KV 持久，跨实例汇总。"今日"=当前额度日，与 Zen 免费额度同步，每天北京时间 8 点（UTC 0 点）翻新。',
+      更新时间: new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC',
+      今日: {
+        日期: day,
+        调用: get(`day|${day}`),
+        输入tokens: get(`tok_in|day|${day}`),
+        输出tokens: get(`tok_out|day|${day}`),
+      },
+      总调用: {
+        次数: get('calls'),
+        成功: get('kind|ok'),
+        限流429: get('kind|429'),
+        其他错误: get('kind|err'),
+        鉴权失败: get('authfail'),
+      },
+      各模型: Object.entries(out)
+        .filter(([k]) => k.startsWith('model|'))
+        .map(([k, v]) => ({ model: k.slice(6), calls: v }))
+        .sort((a, b) => b.calls - a.calls),
+    })
+  }
+
   // ---- 环境变量检查（后续所有路径都需要） ----
   const PROXY_API_KEY = env('PROXY_API_KEY')
   const ZEN_API_KEY = env('ZEN_API_KEY')
@@ -595,6 +720,7 @@ async function handle(request) {
     ''
   if (!incoming || incoming !== PROXY_API_KEY) {
     log({ rid, path: url.pathname, authFail: true, gotKey: !!incoming })
+    bump(['stat', 'authfail'])
     return json({ error: { message: 'Unauthorized: 代理钥匙不对或没带' } }, 401)
   }
   if (url.pathname.endsWith('/chat/completions')) {
@@ -666,6 +792,7 @@ async function handle(request) {
     } catch (err) {
       dbg.upstreamStatus = 'fetch-error'; dbg.error = String(err); pushDbg(dbg)
       log({ rid, phase: 'fetch-error', error: String(err) })
+      recordCall({ model, status: 0 })
       return json({ error: { message: '连不上上游: ' + String(err) } }, 502)
     }
     dbg.upstreamStatus = upstream.status
@@ -676,6 +803,7 @@ async function handle(request) {
       dbg.诊断 = diagnose(dbg)
       pushDbg(dbg)
       log({ rid, phase: 'upstream-error', status: upstream.status, body: text.slice(0, 120) })
+      recordCall({ model, status: upstream.status })
       return new Response(text || JSON.stringify({ error: { message: '上游返回 ' + upstream.status } }), {
         status: upstream.status,
         headers: { ...CORS_HEADERS, 'Content-Type': upstream.headers.get('Content-Type') || 'application/json' },
@@ -683,6 +811,8 @@ async function handle(request) {
     }
 
     if (responsesBody.stream) {
+      recordCall({ model, status: 200 })
+      dbg.usageCb = recordTokens // 流结束时把 usage 的 token 数记进统计
       const outHeaders = new Headers({ ...CORS_HEADERS, 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store' })
       return new Response(transformResponsesStreamToChat(upstream.body, model, upstream.headers.get('x-request-id') || crypto.randomUUID(), dbg), { status: 200, headers: outHeaders })
     }
@@ -690,8 +820,10 @@ async function handle(request) {
     if (!respJson) {
       dbg.upstreamError = '非 JSON'; dbg.诊断 = '上游返回非 JSON，把 /debug 发我'
       pushDbg(dbg)
+      recordCall({ model, status: 200 })
       return json({ error: { message: '上游返回非 JSON' } }, 502)
     }
+    recordCall({ model, status: 200, usage: respJson.usage })
     const outHeaders = new Headers({ ...CORS_HEADERS, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
     return new Response(JSON.stringify(responsesToChatResponse(respJson, model, dbg)), { status: 200, headers: outHeaders })
   }
@@ -706,8 +838,11 @@ async function handle(request) {
   try {
     upstream = await fetch(upstreamUrl, { method: request.method, headers, body, redirect: 'follow' })
   } catch (err) {
+    if (url.pathname.endsWith('/chat/completions')) recordCall({ model, status: 0 })
     return json({ error: { message: '连不上上游: ' + String(err) } }, 502)
   }
+
+  if (url.pathname.endsWith('/chat/completions')) recordCall({ model, status: upstream.status })
 
   if (!upstream.ok) {
     const text = await upstream.text().catch(() => '')
