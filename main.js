@@ -140,45 +140,63 @@ loadStats(); setInterval(loadStats, 30000)
 // ============================================================================
 const STATS_MEM = {}
 let kv = null
-try { kv = await Deno.openKv() } catch { kv = null } // 本地跑需 --unstable-kv；Deploy 上默认可用
+let kvErr = null
+try { kv = await Deno.openKv() } catch (e) { kv = null; kvErr = String(e) } // 本地跑需 --unstable-kv；Deploy 上默认可用
 
 /** "额度日"日期串：跟随 Zen 免费额度规则，每天 UTC 0 点（北京时间早上 8 点）翻新 */
 const bjDate = () => new Date().toISOString().slice(0, 10)
 
-async function bump(key, n = 1) {
-  if (!n) return
-  try {
-    if (kv) {
-      await kv.atomic().sum(key, BigInt(n)).commit()
-      return
+// 关键：必须把同一请求的多次 bump 合并成一个原子提交并 await 完成。
+// Deno Deploy 在响应返回后会冻结实例，"发射后不管"的异步写入会被直接丢弃
+// ——这正是线上计数全零的根因。
+async function bumpAll(keys) {
+  if (!kv) {
+    for (const [k, n] of keys) {
+      const key = k.split('|')
+      STATS_MEM[k] = (STATS_MEM[k] || 0) + (n || 1)
     }
-  } catch (e) {
-    try { console.log('[zen-proxy] stats-kv-fallback', key.join('|'), String(e)) } catch { }
+    return
   }
-  const k = key.join('|')
-  STATS_MEM[k] = (STATS_MEM[k] || 0) + n
+  try {
+    let atom = kv.atomic()
+    for (const [k, n] of keys) atom = atom.sum(k.split('|'), BigInt(n || 1))
+    await atom.commit()
+    return
+  } catch (e) {
+    try { console.log('[zen-proxy] stats-kv-fallback', keys.map((x) => x.join('=')).join(','), String(e)) } catch { }
+  }
+  for (const [k, n] of keys) STATS_MEM[k] = (STATS_MEM[k] || 0) + (n || 1)
 }
 
-/** 只记 token 消耗（流式转换结束时的 usage 回调用） */
-function recordTokens(usage) {
+/** 只记 token 消耗（流式转换结束时的 usage 回调用），必须在流关闭前 await */
+async function recordTokens(usage) {
   if (!usage) return
   const day = bjDate()
-  bump(['stat', 'tok_in', 'day', day], usage.input_tokens || 0)
-  bump(['stat', 'tok_out', 'day', day], usage.output_tokens || 0)
+  await bumpAll([
+    [`stat|tok_in|day|${day}`, usage.input_tokens || 0],
+    [`stat|tok_out|day|${day}`, usage.output_tokens || 0],
+  ])
 }
 
 /**
- * 一次 chat/completions 调用结束后的计数入口（不含任何对话内容）
+ * 一次 chat/completions 调用结束后的计数入口（不含任何对话内容）。
+ * 返回 Promise —— 调用方必须 await 它，赶在响应返回前写完，否则 Deploy 会丢计数。
  * status: 上游最终 HTTP 状态（0 = 连不上上游）
  */
-function recordCall({ model, status, usage }) {
+async function recordCall({ model, status, usage }) {
   const kind = status === 200 ? 'ok' : (status === 429 ? '429' : 'err')
   const day = bjDate()
-  bump(['stat', 'calls'])
-  bump(['stat', 'kind', kind])
-  bump(['stat', 'day', day])
-  bump(['stat', 'model', model || 'unknown'])
-  if (usage) recordTokens(usage)
+  const keys = [
+    ['stat|calls', 1],
+    [`stat|kind|${kind}`, 1],
+    [`stat|day|${day}`, 1],
+    [`stat|model|${model || 'unknown'}`, 1],
+  ]
+  if (usage && (usage.input_tokens || usage.output_tokens)) {
+    keys.push([`stat|tok_in|day|${day}`, usage.input_tokens || 0])
+    keys.push([`stat|tok_out|day|${day}`, usage.output_tokens || 0])
+  }
+  await bumpAll(keys)
 }
 
 // ===== 诊断环形缓冲：记录最近 8 次请求的关键信息（不含对话内容） =====
@@ -546,8 +564,8 @@ function transformResponsesStreamToChat(upstreamBody, model, respId, dbg) {
         })
       }
       controller.enqueue(encoder.encode('data: [DONE]\n\n'))
-      controller.close()
-      if (usage && dbg?.usageCb) { try { dbg.usageCb(usage) } catch { } }
+      if (usage && dbg?.usageCb) { try { await dbg.usageCb(usage) } catch { } }
+      try { controller.close() } catch { }
       if (dbg) {
         dbg.events = events
         dbg.emittedToolChunks = emittedToolChunks
@@ -661,6 +679,7 @@ async function handle(request) {
     const get = (k) => out[k] || 0
     return json({
       说明: '代理的 chat/completions 调用统计（仅聚合计数，不含对话内容）。Deno KV 持久，跨实例汇总。"今日"=当前额度日，与 Zen 免费额度同步，每天北京时间 8 点（UTC 0 点）翻新。',
+      KV状态: kv ? '正常（跨实例持久）' : '不可用（退化为单实例内存，数字会不准）' + (kvErr ? '：' + kvErr : ''),
       更新时间: new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC',
       今日: {
         日期: day,
@@ -720,7 +739,7 @@ async function handle(request) {
     ''
   if (!incoming || incoming !== PROXY_API_KEY) {
     log({ rid, path: url.pathname, authFail: true, gotKey: !!incoming })
-    bump(['stat', 'authfail'])
+    await bumpAll([['stat|authfail', 1]])
     return json({ error: { message: 'Unauthorized: 代理钥匙不对或没带' } }, 401)
   }
   if (url.pathname.endsWith('/chat/completions')) {
@@ -792,7 +811,7 @@ async function handle(request) {
     } catch (err) {
       dbg.upstreamStatus = 'fetch-error'; dbg.error = String(err); pushDbg(dbg)
       log({ rid, phase: 'fetch-error', error: String(err) })
-      recordCall({ model, status: 0 })
+      await recordCall({ model, status: 0 })
       return json({ error: { message: '连不上上游: ' + String(err) } }, 502)
     }
     dbg.upstreamStatus = upstream.status
@@ -803,7 +822,7 @@ async function handle(request) {
       dbg.诊断 = diagnose(dbg)
       pushDbg(dbg)
       log({ rid, phase: 'upstream-error', status: upstream.status, body: text.slice(0, 120) })
-      recordCall({ model, status: upstream.status })
+      await recordCall({ model, status: upstream.status })
       return new Response(text || JSON.stringify({ error: { message: '上游返回 ' + upstream.status } }), {
         status: upstream.status,
         headers: { ...CORS_HEADERS, 'Content-Type': upstream.headers.get('Content-Type') || 'application/json' },
@@ -811,8 +830,8 @@ async function handle(request) {
     }
 
     if (responsesBody.stream) {
-      recordCall({ model, status: 200 })
-      dbg.usageCb = recordTokens // 流结束时把 usage 的 token 数记进统计
+      await recordCall({ model, status: 200 })
+      dbg.usageCb = recordTokens // 流结束时把 usage 的 token 数记进统计（transform 内部会 await）
       const outHeaders = new Headers({ ...CORS_HEADERS, 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store' })
       return new Response(transformResponsesStreamToChat(upstream.body, model, upstream.headers.get('x-request-id') || crypto.randomUUID(), dbg), { status: 200, headers: outHeaders })
     }
@@ -820,10 +839,10 @@ async function handle(request) {
     if (!respJson) {
       dbg.upstreamError = '非 JSON'; dbg.诊断 = '上游返回非 JSON，把 /debug 发我'
       pushDbg(dbg)
-      recordCall({ model, status: 200 })
+      await recordCall({ model, status: 200 })
       return json({ error: { message: '上游返回非 JSON' } }, 502)
     }
-    recordCall({ model, status: 200, usage: respJson.usage })
+    await recordCall({ model, status: 200, usage: respJson.usage })
     const outHeaders = new Headers({ ...CORS_HEADERS, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
     return new Response(JSON.stringify(responsesToChatResponse(respJson, model, dbg)), { status: 200, headers: outHeaders })
   }
@@ -838,11 +857,11 @@ async function handle(request) {
   try {
     upstream = await fetch(upstreamUrl, { method: request.method, headers, body, redirect: 'follow' })
   } catch (err) {
-    if (url.pathname.endsWith('/chat/completions')) recordCall({ model, status: 0 })
+    if (url.pathname.endsWith('/chat/completions')) await recordCall({ model, status: 0 })
     return json({ error: { message: '连不上上游: ' + String(err) } }, 502)
   }
 
-  if (url.pathname.endsWith('/chat/completions')) recordCall({ model, status: upstream.status })
+  if (url.pathname.endsWith('/chat/completions')) await recordCall({ model, status: upstream.status })
 
   if (!upstream.ok) {
     const text = await upstream.text().catch(() => '')
