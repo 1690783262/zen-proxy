@@ -77,12 +77,15 @@ Deno.serve(async (req) => {
     return new Response(null, { status: 204, headers: corsHeaders() });
   }
 
-  // 可选口令校验（在环境变量里配置 ACCESS_TOKEN 即启用）
+  // 可选口令校验：x-api-token 头 / ?token= 参数 / Authorization Bearer 三者任一匹配即可
   const accessToken = Deno.env.get("ACCESS_TOKEN");
   if (accessToken) {
     const provided =
       req.headers.get("x-api-token") || url.searchParams.get("token") || "";
-    if (provided !== accessToken) {
+    const bearer = (req.headers.get("authorization") || "")
+      .replace(/^Bearer /i, "")
+      .trim();
+    if (provided !== accessToken && bearer !== accessToken) {
       return json(
         { error: { message: "unauthorized: missing or invalid x-api-token" } },
         401,
