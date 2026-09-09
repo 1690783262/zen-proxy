@@ -43,6 +43,32 @@ function json(obj, status = 200) {
   });
 }
 
+// 最近请求记录（用于 /__debug 排查鉴权头问题，只保留脱敏后的值）
+const recentRequests = [];
+
+function mask(v) {
+  if (!v) return null;
+  const prefix = v.slice(0, 7).startsWith("Bearer ")
+    ? "Bearer " + v.slice(7, 12) + "..."
+    : v.slice(0, 8) + "...";
+  return prefix + " (长度 " + v.length + ")";
+}
+
+function recordRequest(req, url) {
+  recentRequests.unshift({
+    time: new Date().toISOString(),
+    method: req.method,
+    path: url.pathname,
+    authorization: mask(req.headers.get("authorization")),
+    "x-api-key": mask(req.headers.get("x-api-key")),
+    "api-key": mask(req.headers.get("api-key")),
+    "x-api-token": mask(req.headers.get("x-api-token")),
+    contentType: req.headers.get("content-type"),
+    userAgent: (req.headers.get("user-agent") || "").slice(0, 60),
+  });
+  if (recentRequests.length > 10) recentRequests.pop();
+}
+
 Deno.serve(async (req) => {
   const url = new URL(req.url);
 
@@ -70,8 +96,15 @@ Deno.serve(async (req) => {
       service: "kirra-api-proxy",
       upstream: UPSTREAM + API_PREFIX,
       usage: "把 Hermes 的 API 地址设为 https://<你的deno域名>/v1 即可",
+      debug: "GET /__debug 查看最近请求的鉴权头（排查 Hermes 认证问题用）",
     });
   }
+
+  // 调试端点：查看最近 10 个请求带了什么鉴权头（值已脱敏）
+  if (url.pathname === "/__debug") {
+    return json({ recent: recentRequests });
+  }
+  recordRequest(req, url);
 
   // 路径映射：去掉 /v1 或 /api/v1 前缀，统一转发到上游 /api/v1/*
   let path = url.pathname;
@@ -87,6 +120,26 @@ Deno.serve(async (req) => {
   const headers = new Headers(req.headers);
   for (const h of HOP_HEADERS) headers.delete(h);
   headers.set("accept-encoding", "gzip, br");
+
+  // 鉴权头归一化：
+  // 1) 客户端用了 x-api-key / api-key 而没有 Authorization → 转成 Bearer
+  // 2) Authorization 里没写 "Bearer " 前缀 → 补上
+  if (!headers.get("authorization")) {
+    const alt = req.headers.get("x-api-key") || req.headers.get("api-key");
+    if (alt) headers.set("authorization", "Bearer " + alt);
+  }
+  const authHeader = headers.get("authorization");
+  if (authHeader && !/^bearer /i.test(authHeader)) {
+    headers.set("authorization", "Bearer " + authHeader);
+  }
+
+  // Key 注入：如果配置了环境变量 KIRRA_API_KEY，则无条件用它替换鉴权头。
+  // 这样 Hermes 可以继续填任意的代理口令（如旧的 PROXY_API_KEY），
+  // 真正的 Kirra Key 只保存在服务端，不暴露给客户端。
+  const kirraKey = Deno.env.get("KIRRA_API_KEY");
+  if (kirraKey) {
+    headers.set("authorization", "Bearer " + kirraKey);
+  }
 
   const hasBody = req.method !== "GET" && req.method !== "HEAD";
 
