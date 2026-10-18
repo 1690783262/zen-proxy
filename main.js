@@ -87,7 +87,9 @@ async function recordCall({ provider, model, status, usage }) {
     ['stat|calls', 1],
     [`stat|kind|${kind}`, 1],
     [`stat|day|${day}`, 1],
-    [`stat|model|${provider}:${model || 'unknown'}`, 1],
+    // 模型维度按"额度日"记账：首页只展示本日调用过的模型，每天 8 点自动换新，
+    // 避免标签列表随时间无限变长
+    [`stat|dmodel|${day}|${provider}:${model || 'unknown'}`, 1],
   ]
   if (usage && (usage.input_tokens || usage.output_tokens)) {
     keys.push([`stat|tok_in|day|${day}`, usage.input_tokens || 0])
@@ -229,8 +231,8 @@ async function handle(request) {
         鉴权失败: get('authfail'),
       },
       各模型: Object.entries(out)
-        .filter(([k]) => k.startsWith('model|'))
-        .map(([k, v]) => ({ model: k.slice(6), calls: v }))
+        .filter(([k]) => k.startsWith(`dmodel|${day}|`))
+        .map(([k, v]) => ({ model: k.slice(`dmodel|${day}|`.length), calls: v }))
         .sort((a, b) => b.calls - a.calls),
     })
   }
