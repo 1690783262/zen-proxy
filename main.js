@@ -157,14 +157,17 @@ function genUrl(){
   const raw = document.getElementById('g-upstream').value.trim()
   const access = document.getElementById('g-access').value.trim() || '{access}'
   const hint = document.getElementById('g-hint')
+  // 注意：本页由模板字符串生成，页面 JS 里不要用带反斜杠的正则（反斜杠会被转义吃掉），一律用字符串操作
   let scheme = 'https'
-  let rest = raw.replace(/^https?:\/\//i, function(m){
-    if (m.toLowerCase().indexOf('http:') === 0) scheme = 'http'
-    return ''
-  })
+  let rest = raw
+  if (rest.toLowerCase().indexOf('https://') === 0) { scheme = 'https'; rest = rest.slice(8) }
+  else if (rest.toLowerCase().indexOf('http://') === 0) { scheme = 'http'; rest = rest.slice(7) }
   if (!rest) { hint.textContent = '请先填供应商地址'; return }
-  rest = rest.replace(/\?.*$/, '').replace(/\/+$/, '')
-  if (!/\./.test(rest.split('/')[0])) { hint.textContent = '地址第一段不像域名，请检查'; return }
+  const q = rest.indexOf('?')
+  if (q >= 0) rest = rest.slice(0, q)
+  while (rest.charAt(rest.length - 1) === '/') rest = rest.slice(0, -1)
+  const first = rest.split('/')[0]
+  if (first.indexOf('.') < 0 && first.indexOf(':') < 0) { hint.textContent = '地址第一段不像域名，请检查'; return }
   const hostPart = scheme === 'http' ? 'http~' + rest : rest
   document.getElementById('g-result').value = location.origin + '/' + access + '/' + hostPart
   hint.textContent = '生成成功，直接粘贴到客户端 base_url'
