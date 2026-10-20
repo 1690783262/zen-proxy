@@ -133,6 +133,17 @@ code{background:#f0f2f4;padding:2px 6px;border-radius:4px;font-size:13px}
 <p id="s-extra" class="muted" style="margin-bottom:0">加载中…</p>
 </div>
 <div class="box">
+<p style="margin-top:0"><b>零配置地址生成器</b> <span class="muted">（粘贴供应商地址，自动生成 base_url）</span></p>
+<p>供应商 API 地址：<input id="g-upstream" type="text" placeholder="https://api.example.com/v1" style="width:100%;padding:6px 8px;margin:4px 0;border:1px solid #d8dee4;border-radius:6px;box-sizing:border-box;font-size:13px"></p>
+<p>你的 access 钥匙：<input id="g-access" type="text" placeholder="sk-...（留空则用 {access} 占位）" style="width:100%;padding:6px 8px;margin:4px 0;border:1px solid #d8dee4;border-radius:6px;box-sizing:border-box;font-size:13px"></p>
+<p><button onclick="genUrl()" style="padding:6px 18px;border:1px solid #0969da;background:#0969da;color:#fff;border-radius:6px;cursor:pointer">生成</button></p>
+<p>生成的 base_url：</p>
+<p><input id="g-result" type="text" readonly style="width:100%;padding:6px 8px;border:1px solid #d8dee4;border-radius:6px;box-sizing:border-box;font-size:13px;background:#fff"></p>
+<p><button onclick="copyUrl()" id="g-copy" style="padding:6px 18px;border:1px solid #d8dee4;background:#f6f8fa;border-radius:6px;cursor:pointer">复制</button>
+<span id="g-hint" class="muted"></span></p>
+<p class="muted">api key 填该供应商自己的 key；http 上址会自动加 <code>http~</code> 前缀。</p>
+</div>
+<div class="box">
 <p style="margin-top:0"><b>用法（两种写法，任选）</b></p>
 <p><b>零配置</b>：base_url 填 <code>https://本域名/{access}/{供应商域名}/{路径...}</code></p>
 <p>例：<code>https://本域名/sk-xxx/developer.amd.com.cn/radeon/api/v1</code>（域名段含点号即可，无需注册）</p>
@@ -142,6 +153,30 @@ code{background:#f0f2f4;padding:2px 6px;border-radius:4px;font-size:13px}
 <p>其他端点：<code>GET /stats</code>（统计 JSON）、<code>GET /ip</code>（出网自检）</p>
 <script>
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function genUrl(){
+  const raw = document.getElementById('g-upstream').value.trim()
+  const access = document.getElementById('g-access').value.trim() || '{access}'
+  const hint = document.getElementById('g-hint')
+  let scheme = 'https'
+  let rest = raw.replace(/^https?:\/\//i, function(m){
+    if (m.toLowerCase().indexOf('http:') === 0) scheme = 'http'
+    return ''
+  })
+  if (!rest) { hint.textContent = '请先填供应商地址'; return }
+  rest = rest.replace(/\?.*$/, '').replace(/\/+$/, '')
+  if (!/\./.test(rest.split('/')[0])) { hint.textContent = '地址第一段不像域名，请检查'; return }
+  const hostPart = scheme === 'http' ? 'http~' + rest : rest
+  document.getElementById('g-result').value = location.origin + '/' + access + '/' + hostPart
+  hint.textContent = '生成成功，直接粘贴到客户端 base_url'
+}
+function copyUrl(){
+  const el = document.getElementById('g-result')
+  if (!el.value) return
+  el.select()
+  try { navigator.clipboard.writeText(el.value) } catch(e) { document.execCommand('copy') }
+  document.getElementById('g-copy').textContent = '已复制 ✓'
+  setTimeout(function(){ document.getElementById('g-copy').textContent = '复制' }, 1500)
+}
 async function loadStats(){
   try{
     const s = await (await fetch('/stats',{cache:'no-store'})).json()
